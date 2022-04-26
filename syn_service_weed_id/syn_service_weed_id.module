@@ -1,0 +1,538 @@
+<?php
+
+/**
+ * @file
+ * Code for the Service: Weed ID feature.
+ */
+
+include_once 'syn_service_weed_id.features.inc';
+include_once 'syn_service_weed_id.form.inc';
+
+define('SYN_SERVICE_WEED_ID_WATCHDOG', 'Syn Weed ID');
+
+/**
+ * Implements hook_syn_service_subscription_form().
+ */
+function syn_service_weed_id_syn_service_subscription_form($service_nid, $uid, $flag_type) {
+  if ($flag_type == 'service_weed_id') {
+    return array(
+      '#type' => 'subform',
+      '#subform_id' => 'syn_service_subscribe_form',
+      '#subform_arguments' => array(
+        flag_get_flag($flag_type),
+        $service_nid,
+        $uid,
+      ),
+      '#required' => TRUE,
+    );
+  }
+}
+
+/**
+ * Implements hook_ctools_plugin_directory().
+ */
+function syn_service_weed_id_ctools_plugin_directory($owner, $plugin) {
+  if ($owner == 'ctools' && $plugin) {
+    return 'plugins/' . $plugin;
+  }
+}
+
+/**
+ * Implements hook_theme().
+ */
+function syn_service_weed_id_theme($existing, $type, $theme, $path) {
+  return array(
+    'service_configuration__weed_id' => array(
+      'render element' => 'elements',
+      'path' => $path . '/templates',
+      'template' => 'service_configuration--weed_id',
+    ),
+    'node_target__modal_dialog' => array(
+      'render element' => 'elements',
+      'path' => $path . '/templates',
+      'template' => 'node_target--modal_dialog',
+    ),
+  );
+}
+
+/**
+ * Implements hook_form_FORM_ID_alter().
+ */
+function syn_service_weed_id_form_taxonomy_form_term_alter(&$form, &$form_state) {
+  // Hide weed types field. Its populated in taxonomy presave.
+  // @see syn_service_weed_id_taxonomy_term_presave
+  if (
+      isset($form['#bundle']) &&
+      $form['#bundle'] === 'service_weed_id_criteria' &&
+      !empty($form['field_weed_id_weed_types'])
+  ) {
+    $form['field_weed_id_weed_types']['#access'] = FALSE;
+  }
+}
+
+/**
+ * Implements hook_taxonomy_term_presave().
+ */
+function syn_service_weed_id_taxonomy_term_presave($term) {
+  // Save the weed types in another field outside the field collection for
+  // performance reasons.
+  if ($term->vocabulary_machine_name === 'service_weed_id_criteria') {
+    $term->field_weed_id_weed_types = array(LANGUAGE_NONE => array());
+    foreach (field_get_items('taxonomy_term', $term, 'field_weed_data') as $weed_data) {
+      if (!empty($weed_data['field_weed_type'][LANGUAGE_NONE][0]['value'])) {
+        $value = $weed_data['field_weed_type'][LANGUAGE_NONE][0]['value'];
+
+      }
+      elseif (!empty($weed_data['entity']->field_weed_type[LANGUAGE_NONE][0]['value'])) {
+        // This is case of import criteria from migration class.
+        $service_weed_types = syn_service_weed_id_get_weed_types();
+        $value = $weed_data['entity']->field_weed_type[LANGUAGE_NONE][0]['value'];
+      }
+      elseif (!empty($weed_data['value'])) {
+        $value = entity_metadata_wrapper('field_collection_item', $weed_data['value'])->field_weed_type->value();
+      }
+      else {
+        continue;
+      }
+      $term->field_weed_id_weed_types[LANGUAGE_NONE][] = array(
+        'format' => NULL,
+        'value' => $value,
+      );
+    }
+  }
+
+}
+
+/**
+ * Implements hook_entity_info_alter().
+ */
+function syn_service_weed_id_entity_info_alter(&$entity_info) {
+  // Add a custom view mode for the criteria image.
+  $entity_info['file']['view modes'] += array(
+    'service_weed_id_criteria_img' => array(
+      'label' => t('Service: Weed ID: Criteria'),
+      'custom settings' => TRUE,
+    ),
+  );
+}
+
+/**
+ * Implements hook_entity_update().
+ */
+function syn_service_weed_id_entity_update($entity, $type) {
+  // On updating service configuration weed id replace old keys with new one in
+  // criteria taxonomy or remove removed old keys from criteria taxonomy.
+  if ($type === 'service_configuration' && $entity->type === 'weed_id') {
+    // Get new keys.
+    $keys_new = syn_service_weed_id_get_keys(entity_metadata_wrapper('service_configuration', $entity));
+    // Get old keys.
+    $keys_old = syn_service_weed_id_get_keys(entity_metadata_wrapper('service_configuration', $entity->original));
+    // If old keys are missing or the old and new keys are same do nothing.
+    if (!empty($keys_old) && $keys_new !== $keys_old) {
+      // Storing associative array for replacement: key is the old key and the
+      // value will be the new one.
+      // Storing keys for removal, e.g. old key is removed and not used.
+      $replace = $remove = array();
+      // Loop threw the old keys.
+      foreach ($keys_old as $old_key) {
+        // If the old key is present in the new keys do nothing.
+        if (!in_array($old_key, $keys_new)) {
+          // Get the old key suffix.
+          list(, $old_key_suffix) = explode('__', $old_key);
+          // Loop threw the new keys.
+          foreach ($keys_new as $new_key) {
+            // If the key suffix is the same, the we should replace the old key
+            // with the new one. This happens on title change.
+            if (strpos($new_key, '__' . $old_key_suffix)) {
+              $replace[$old_key] = $new_key;
+              continue 2;
+            }
+          }
+          // Old key is not used anymore, remove it from criteria taxonomies.
+          $remove[] = $old_key;
+        }
+      }
+      // Remove unused old keys.
+      if (count($remove)) {
+        $taxonomies = (new EntityFieldQuery())
+          ->entityCondition('entity_type', 'taxonomy_term')
+          ->entityCondition('bundle', 'service_weed_id_criteria')
+          ->fieldCondition('field_weed_id_weed_types', 'value', $remove, 'IN')
+          ->execute();
+        if (!empty($taxonomies['taxonomy_term'])) {
+          foreach (array_keys($taxonomies['taxonomy_term']) as $taxonomy_tid) {
+            $taxonomy = taxonomy_term_load($taxonomy_tid);
+            if (!empty($taxonomy->field_weed_data[LANGUAGE_NONE])) {
+              foreach ($taxonomy->field_weed_data[LANGUAGE_NONE] as $index => $data) {
+                $field_collection = entity_metadata_wrapper('field_collection_item', $data['value']);
+                if (in_array($field_collection->field_weed_type->value(), $remove)) {
+                  $field_collection->delete();
+                  unset($taxonomy->field_weed_data[LANGUAGE_NONE][$index]);
+                }
+              }
+            }
+            $taxonomy->field_weed_data[LANGUAGE_NONE] = array_values($taxonomy->field_weed_data[LANGUAGE_NONE]);
+            taxonomy_term_save($taxonomy);
+          }
+        }
+      }
+      // Replace old keys with new ones.
+      if (count($replace)) {
+        $taxonomies = (new EntityFieldQuery())
+          ->entityCondition('entity_type', 'taxonomy_term')
+          ->entityCondition('bundle', 'service_weed_id_criteria')
+          ->fieldCondition('field_weed_id_weed_types', 'value', array_keys($replace), 'IN')
+          ->execute();
+        if (!empty($taxonomies['taxonomy_term'])) {
+          foreach (array_keys($taxonomies['taxonomy_term']) as $taxonomy_tid) {
+            $taxonomy = taxonomy_term_load($taxonomy_tid);
+            if (!empty($taxonomy->field_weed_data[LANGUAGE_NONE])) {
+              foreach ($taxonomy->field_weed_data[LANGUAGE_NONE] as $data) {
+                $field_collection = entity_metadata_wrapper('field_collection_item', $data['value']);
+                if (array_key_exists($field_collection->field_weed_type->value(), $replace)) {
+                  $field_collection->field_weed_type->set($replace[$field_collection->field_weed_type->value()]);
+                  $field_collection->save(TRUE);
+                }
+              }
+            }
+            taxonomy_term_save(taxonomy_term_load($taxonomy_tid));
+          }
+        }
+      }
+    }
+  }
+}
+
+/**
+ * Implements hook_entity_delete().
+ */
+function syn_service_weed_id_entity_delete($entity, $type) {
+  // On deleting weed type delete all the field collection where this weed type
+  // is stored.
+  if (
+      $type === 'service_configuration' &&
+      $entity->type === 'weed_id' &&
+      ($keys = syn_service_weed_id_get_keys(entity_metadata_wrapper('service_configuration', $entity)))
+  ) {
+    foreach ($keys as $key) {
+      $taxonomies = (new EntityFieldQuery())
+        ->entityCondition('entity_type', 'taxonomy_term')
+        ->entityCondition('bundle', 'service_weed_id_criteria')
+        ->fieldCondition('field_weed_id_weed_types', 'value', $key)
+        ->execute();
+      if (!empty($taxonomies['taxonomy_term'])) {
+        foreach (array_keys($taxonomies['taxonomy_term']) as $taxonomy_tid) {
+          $taxonomy = taxonomy_term_load($taxonomy_tid);
+          if (!empty($taxonomy->field_weed_data[LANGUAGE_NONE])) {
+            foreach ($taxonomy->field_weed_data[LANGUAGE_NONE] as $index => $data) {
+              $field_collection = entity_metadata_wrapper('field_collection_item', $data['value']);
+              if ($field_collection->field_weed_type->value() === $key) {
+                $field_collection->delete();
+                unset($taxonomy->field_weed_data[LANGUAGE_NONE][$index]);
+              }
+            }
+          }
+          $taxonomy->field_weed_data[LANGUAGE_NONE] = array_values($taxonomy->field_weed_data[LANGUAGE_NONE]);
+          taxonomy_term_save($taxonomy);
+        }
+      }
+    }
+  }
+}
+
+/**
+ * Implements hook_field_attach_form().
+ *
+ * Alter the service weed id criteria taxonomy field for choosing criteria type
+ * by adding optiongroups.
+ */
+function syn_service_weed_id_field_attach_form($entity_type, $entity, &$form, &$form_state, $langcode) {
+  if (
+      $entity_type === 'taxonomy_term' &&
+      $entity->vocabulary_machine_name === 'service_weed_id_criteria' &&
+      !empty($form['field_weed_id_criteria_type'][LANGUAGE_NONE]['#options'])
+  ) {
+    // Instantiate the language.
+    global $language;
+    // Instantiate new options array.
+    $options = array();
+
+    $types_results = (new EntityFieldQuery())
+      ->entityCondition('entity_type', 'taxonomy_term')
+      ->entityCondition('bundle', 'service_weed_id_criteria_type')
+      ->propertyOrderBy('weight', 'ASC')
+      ->execute();
+    // Load the types taxonomies.
+    $types = empty($types_results['taxonomy_term']) ? array() : taxonomy_term_load_multiple(array_keys($types_results['taxonomy_term']));
+
+    $groups_results = (new EntityFieldQuery())
+      ->entityCondition('entity_type', 'taxonomy_term')
+      ->entityCondition('bundle', 'service_weed_id_criteria_group')
+      ->propertyOrderBy('weight', 'ASC')
+      ->execute();
+    // Load the groups taxonomies.
+    $groups = empty($groups_results['taxonomy_term']) ? array() : taxonomy_term_load_multiple(array_keys($groups_results['taxonomy_term']));
+
+    // Loop threw all criteria groups taxonomies.
+    foreach ($groups as $group) {
+      // Load the metadata wrapper.
+      $group_wrapper = entity_metadata_wrapper('taxonomy_term', $group);
+      // Set the current language.
+      $group_wrapper->language($language->language);
+      $options[$group_wrapper->name_field->value()] = array();
+      // Loop threw all criteria types taxonomies.
+      foreach ($types as $type) {
+        // Load the metadata wrapper.
+        $type_wrapper = entity_metadata_wrapper('taxonomy_term', $type);
+        // Check if the group of the type is the same and add the taxonomy to
+        // the options group.
+        if (
+            $type_wrapper->__isset('field_weed_id_group') &&
+            $type_wrapper->field_weed_id_group->value() &&
+            $type_wrapper->field_weed_id_group->value()->tid == $group_wrapper->tid->value()
+        ) {
+          $options[$group_wrapper->name_field->value()][$type_wrapper->tid->value()] = $type_wrapper->name_field->value();
+        }
+
+        // Remove the options group if no criteria types are inside.
+        if (empty($options[$group_wrapper->name_field->value()])) {
+          unset($options[$group_wrapper->name_field->value()]);
+        }
+      }
+
+      $form['field_weed_id_criteria_type'][LANGUAGE_NONE]['#options'] = $options;
+    }
+  }
+}
+
+/**
+ * Implements hook_menu().
+ */
+function syn_service_weed_id_menu() {
+  return array(
+    'service-weed-id/popup/%/%/%' => array(
+      'page callback' => 'syn_service_weed_id_pages_ctools_modal',
+      'page arguments' => array(2, 3, 4),
+      'access callback' => TRUE,
+      'type' => MENU_CALLBACK,
+      'file' => 'syn_service_weed_id.pages.inc',
+    ),
+  );
+}
+
+/**
+ * Implements hook_preprocess_views_pre_render().
+ */
+function syn_service_weed_id_views_pre_render(&$views) {
+  if ($views->name == 'service_weed_id_target') {
+    // Add the ctools modal file and javascripts.
+    ctools_include('modal');
+    ctools_include('ajax');
+    ctools_modal_add_js();
+    $weed_style = array(
+      'weedid-modal-style' => array(
+        'modalSize' => array(
+          'type' => 'fixed',
+          'width' => 750,
+          'height' => 500,
+          'addWidth' => 20,
+          'addHeight' => 15,
+          'contentRight' => 0,
+          'contentBottom' => 0,
+        ),
+        'modalOptions' => array(
+          'opacity' => .6,
+          'background-color' => '#000',
+        ),
+        'animation' => 'fadeIn',
+        'modalTheme' => 'WeedidModal',
+      ),
+    );
+    // Add the settings array defined above to Drupal 7's JS settings:
+    drupal_add_js($weed_style, 'setting');
+    ctools_add_js('syn_service_weed_id.modal', 'syn_service_weed_id');
+    ctools_add_css('syn_service_weed_id.modal', 'syn_service_weed_id');
+  }
+}
+
+/**
+ * Implements hook_preprocess_views_view_fields().
+ */
+function syn_service_weed_id_preprocess_views_view_fields(&$vars) {
+  // Modify target results view from step 3.
+  if ($vars['view']->name === 'service_weed_id_target') {
+    // Modify target results view from step 3.
+    if ($vars['view']->current_display === 'block') {
+      // Adds a checkbox for choosing targets for comparison and a translatable
+      // label.
+      // Translate the compare label.
+      $compare = t('Compare');
+      // Replace the token.
+      $vars['fields']['nothing_1']->content = call_user_func_array('str_replace', array(
+        '@compare',
+        '<label><input type="checkbox" class="weed-id-compare" value="' . $vars['row']->nid . '"/> <b>' . $compare . '</b></label>',
+        $vars['fields']['nothing_1']->content,
+      ));
+      // Add the target header containing dynamic styling based on the match
+      // percent count, match percent text and a magnification glass for the
+      // teaser image.
+      // Set the match percentage in the views result.
+      // @see SynServiceWeedIdFormStepThree::doBuild
+      $match_percent = 0;
+      if (!empty($_SESSION['weed_data']['matches'])) {
+        $match_percent = !in_array($vars['row']->nid, $_SESSION['weed_data']['matches']['100_percent']) ? $match_percent : 100;
+        $match_percent = !in_array($vars['row']->nid, $_SESSION['weed_data']['matches']['75_percent']) ? $match_percent : 75;
+      }
+      // If we have image create a ctools modal link for zooming the image.
+      $image_zoom_link = '';
+      if (!empty($vars['row']->field_field_teaser_image[0]['raw']['fid'])) {
+        $image_zoom_link = call_user_func_array('ctools_modal_text_button', array(
+          // Link title.
+          t('zoom'),
+          // Link path.
+          'service-weed-id/popup/nojs/image/' . $vars['row']->field_field_teaser_image[0]['raw']['fid'],
+          // Alt.
+          NULL,
+          // Class.
+          'image-zoom ctools-modal-weedid-modal-style',
+        ));
+      }
+      // Replace the tokens.
+      $vars['fields']['nothing_2']->content = call_user_func_array('str_replace', array(
+        array(
+          '@match_percent_number',
+          '@match_percent_text',
+          '@image_zoom_link',
+        ),
+        array(
+          $match_percent,
+          t('@match_percent% match', array('@match_percent' => $match_percent)),
+          $image_zoom_link,
+        ),
+        $vars['fields']['nothing_2']->content,
+      ));
+    }
+    // Modify comparison targets view from step 4.
+    elseif ($vars['view']->current_display === 'block_1') {
+      // Add the target header containing dynamic styling based on the match
+      // percent count and the match percent.
+      // Set the match percentage in the views result.
+      // @see SynServiceWeedIdFormStepThree::doBuild
+      $match_percent = 0;
+      if (!empty($_SESSION['weed_data']['matches'])) {
+        $match_percent = !in_array($vars['row']->nid, $_SESSION['weed_data']['matches']['100_percent']) ? $match_percent : 100;
+        $match_percent = !in_array($vars['row']->nid, $_SESSION['weed_data']['matches']['75_percent']) ? $match_percent : 75;
+      }
+      // Replace the tokens.
+      $vars['fields']['nothing_2']->content = call_user_func_array('str_replace', array(
+        array(
+          '@match_percent_number',
+          '@match_percent_text',
+        ),
+        array(
+          $match_percent,
+          t('@match_percent% match', array('@match_percent' => $match_percent)),
+        ),
+        $vars['fields']['nothing_2']->content,
+      ));
+    }
+  }
+  elseif ($vars['view']->name === 'service_weed_id_criteria' && $vars['view']->current_display === 'block_3') {
+    // Get the targets from the views row criteria.
+    $target_tids = explode(', ', $vars['fields']['field_weed_targets']->content);
+    // Get the left and right target arguments.
+    list ($left_target_tid, $right_target_tid) = explode('+', $vars['view']->args[1]);
+    // Set the left dot appropriate class.
+    $vars['fields']['nothing']->wrapper_prefix = call_user_func_array('str_replace', array(
+      'dot_class',
+      in_array($left_target_tid, $target_tids) ? 'green' : 'red',
+      $vars['fields']['nothing']->wrapper_prefix,
+    ));
+    // Set the right dot appropriate class.
+    $vars['fields']['nothing_1']->wrapper_prefix = call_user_func_array('str_replace', array(
+      'dot_class',
+      in_array($right_target_tid, $target_tids) ? 'green' : 'red',
+      $vars['fields']['nothing_1']->wrapper_prefix,
+    ));
+    // Remove the views field content.
+    $vars['fields']['field_weed_targets']->content = '';
+  }
+}
+
+/**
+ * Gets weed type keys based on title, maturity and combined maturity.
+ *
+ * @param object $configuration_wrapper
+ *   The service configuration object from type weed_id.
+ * @param string $maturity_or_combined
+ *   Parameter whether the return should contain only young, adult or combined
+ *   key. If ommited all available keys will be returned.
+ *
+ * @return mixed
+ *   Array of service configuration keys or single key based on
+ *   $maturity_or_combined parameter.
+ */
+function syn_service_weed_id_get_keys($configuration_wrapper, $maturity_or_combined = NULL) {
+  $keys = array();
+
+  if ($configuration_wrapper->field_service_weed_id_combine_ma->value()) {
+    $keys[] = preg_replace('/[^a-z0-9]+/', '_', drupal_strtolower($configuration_wrapper->title->value())) . '__combined';
+  }
+  else {
+    foreach ($configuration_wrapper->field_service_weed_id_maturity->getIterator() as $maturity) {
+      if (!$maturity_or_combined || $maturity->value() === $maturity_or_combined) {
+        $keys[] = preg_replace('/[^a-z0-9]+/', '_', drupal_strtolower($configuration_wrapper->title->value())) . '__' . $maturity->value();
+      }
+    }
+  }
+
+  return $maturity_or_combined ? reset($keys) : $keys;
+}
+
+/**
+ * Return all weed types which are attached to services.
+ *
+ * @return array
+ *   Associative array. All the weed types are extracted from the service
+ *   configurations and are grouped based on the maturity.
+ */
+function syn_service_weed_id_get_weed_types() {
+  $return = array();
+
+  foreach (entity_load('service_configuration', FALSE, array('type' => 'weed_id')) as $weed_type) {
+    $weed_type_wrapper = entity_metadata_wrapper('service_configuration', $weed_type);
+    if ($weed_type_wrapper->field_service_weed_id_combine_ma->value()) {
+      $return[syn_service_weed_id_get_keys($weed_type_wrapper, 'combined')] = $weed_type->title . ' (Combined)';
+    }
+    else {
+      foreach ($weed_type_wrapper->field_service_weed_id_maturity->getIterator() as $maturity) {
+        if ($maturity->value() === 'young') {
+          $return[syn_service_weed_id_get_keys($weed_type_wrapper, 'young')] = $weed_type->title . ' (Young)';
+        }
+        elseif ($maturity->value() === 'adult') {
+          $return[syn_service_weed_id_get_keys($weed_type_wrapper, 'adult')] = $weed_type->title . ' (Adult)';
+        }
+      }
+    }
+  }
+
+  return $return;
+}
+
+/**
+ * Implements hook_syn_taxonomy_migrate_taxonomy().
+ */
+function syn_service_weed_id_syn_taxonomy_migrate_taxonomy() {
+  $return = array();
+  // Get all weed types which are attached to Weed services.
+  $weed_types = syn_service_weed_id_get_weed_types();
+
+  // If weed types are not attached import cannot proceed further.
+  if (count($weed_types) == 0) {
+    return;
+  }
+  if (array_intersect(array('administrator', 'Approver'), $GLOBALS['user']->roles)) {
+    $return['SynServiceWeedIdImportCriteria'] = t('Service Weed ID criteria');
+  }
+  return $return;
+}

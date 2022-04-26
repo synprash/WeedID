@@ -1,0 +1,14 @@
+.ctools-modal-weedid-modal-content {
+  background-color: #f2f5e8 !important;
+  margin: 0 auto;
+}
+.ctools-modal-weedid-modal-content a.close {
+  color: #000 !important;
+  font-size: 18px;
+  font-weight: bold;
+  margin-right: 4px;
+}
+.ctools-modal-weedid-modal-content .modal-content {
+  padding: 15px !important;
+  margin: 0 auto;
+}
